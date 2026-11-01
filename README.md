@@ -155,3 +155,42 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Integer Cent Representation & Remainder Distribution Invariant
+
+Monetary amounts are represented strictly as integer cents (`total_cents INTEGER`, `amount_cents INTEGER`) backed by database constraints (`CHECK (total_cents > 0 AND typeof(total_cents) = 'integer')` and `CHECK (amount_cents >= 0 AND typeof(amount_cents) = 'integer')`). Floating-point arithmetic is completely avoided. Uneven bill splitting computes `base = Math.floor(totalCents / memberCount)` and `remainder = totalCents % memberCount`, distributing extra cents one by one to members in deterministic `member_order ASC`. This mathematically guarantees $\sum \text{shares} \equiv \text{totalCents}$ and safely permits zero-cent shares (e.g. 1 cent among 3 members produces shares `1, 0, 0`).
+
+### 2. Multi-Layer Concurrency & Idempotency Safety
+
+To prevent double payments under concurrent race conditions, we avoided naive read-then-write checks in application memory. Instead, payment processing is executed inside an atomic Cloudflare D1 `batch()` operation:
+1. Conditional status update: `UPDATE bill_shares SET paid_at = ? WHERE id = ? AND paid_at IS NULL`.
+2. Guarded insert: `INSERT INTO payments ... WHERE EXISTS (SELECT 1 FROM bill_shares WHERE id = ? AND paid_at = ?)`.
+3. Database constraints: `CONSTRAINT uq_payments_share UNIQUE (share_id)` and `CONSTRAINT uq_payments_idempotency_key UNIQUE (idempotency_key)`.
+
+When two simultaneous requests attempt to pay the same share, SQLite's unique constraint and conditional update ensure exactly one winner commits. The losing request rolls back cleanly and receives `409 Conflict`. When a request with an existing idempotency key is replayed for the same share, the API returns `200 OK` with the original cached `paidAt` timestamp.
+
+### 3. Correlated Subquery for Balances & Deterministic Sequence
+
+In `GET /api/homes/:homeId/balances`, using multi-table outer joins can cause row multiplicity when members have multiple bills and shares. We utilized a correlated subquery:
+```sql
+SELECT
+  m.id AS memberId,
+  m.name AS name,
+  CAST(COALESCE(
+    (
+      SELECT SUM(s.amount_cents)
+      FROM bill_shares s
+      JOIN bills b ON b.id = s.bill_id
+      WHERE s.member_id = m.id
+        AND b.home_id = m.home_id
+        AND s.paid_at IS NULL
+    ),
+    0
+  ) AS INTEGER) AS outstandingCents
+FROM members m
+WHERE m.home_id = ?
+ORDER BY m.member_order ASC;
+```
+This guarantees that all registered members appear in the response (defaulting to `0` cents if all shares are paid), prevents Cartesian duplication, and preserves the deterministic `member_order ASC` sequence.
